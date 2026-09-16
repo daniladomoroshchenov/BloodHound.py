@@ -85,6 +85,7 @@ class ADDC(ADComputer):
         except:
             logging.debug('No A records found')
 
+        ipv6 = None
         try:
             q6 = self.ad.dnsresolver.resolve(self.hostname, 'AAAA', tcp=self.ad.dns_tcp)
             for rdata in q6:
@@ -103,9 +104,15 @@ class ADDC(ADComputer):
                 else:
                     if _conn:
                         logging.debug('Successful connection to: %s', rdata.address)
-                        ip = f'[{rdata.address}]'
+                        # ldap3 needs the brackets to accept a literal IPv6 address in a server URL
+                        ipv6 = f'[{rdata.address}]'
         except:
             logging.debug('No AAAA records found')
+
+        # Only fall back to IPv6 when no IPv4 address answered: a working address that was
+        # already verified must not be replaced by another family just because DNS has a record
+        if not ip and ipv6:
+            ip = ipv6
 
         if not ip:
             logging.error('Failed to resolve LDAP server IP')

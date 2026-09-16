@@ -43,10 +43,55 @@ from impacket.krb5.asn1 import AP_REQ, AS_REP, TGS_REQ, Authenticator, TGS_REP, 
     Ticket as TicketAsn1, EncTGSRepPart
 from impacket.krb5 import constants
 from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS, sendReceive
-from impacket.krb5.gssapi import CheckSumField, GSS_C_SEQUENCE_FLAG, GSS_C_REPLAY_FLAG, GSS_C_MUTUAL_FLAG
+from impacket.krb5.gssapi import CheckSumField, GSSAPI, GSS_C_SEQUENCE_FLAG, GSS_C_REPLAY_FLAG, GSS_C_MUTUAL_FLAG, GSS_C_CONF_FLAG, GSS_C_INTEG_FLAG
 import datetime
 from pyasn1.type.univ import noValue
 from impacket.spnego import SPNEGO_NegTokenInit, TypesMech
+
+
+class KerberosSignedSocket(object):
+    """
+    Wrapper around a connected LDAP socket that wraps/unwraps every PDU with RFC 4121 tokens.
+
+    A DC with LDAP signing enforced refuses a SASL bind that negotiates no security layer
+    (result code 8, strongerAuthRequired). Once a security layer is negotiated the server
+    expects every subsequent LDAP PDU to be signed/sealed, so the socket is swapped for this
+    wrapper right after a successful bind. Framing is the one impacket's LDAP client uses:
+    4 byte big endian length, 16 byte wrap token, wrapped payload.
+    """
+    def __init__(self, sock, sessionkey, cipher):
+        self._sock = sock
+        self._gss = GSSAPI(cipher)
+        self._key = sessionkey
+        self._seq = 0
+        self._buffer = b''
+
+    def __getattr__(self, name):
+        # close, shutdown, settimeout and anything else go to the real socket
+        return getattr(self._sock, name)
+
+    def _recv_exact(self, size):
+        data = b''
+        while len(data) < size:
+            chunk = self._sock.recv(size - len(data))
+            if not chunk:
+                raise OSError('LDAP connection closed by peer')
+            data += chunk
+        return data
+
+    def sendall(self, data, *args, **kwargs):
+        blob, signature = self._gss.GSS_Wrap_LDAP(self._key, data, self._seq)
+        frame = signature + blob
+        self._seq += 1
+        return self._sock.sendall(len(frame).to_bytes(4, 'big') + frame, *args, **kwargs)
+
+    def recv(self, bufsize, *args, **kwargs):
+        if not self._buffer:
+            length = int.from_bytes(self._recv_exact(4), 'big')
+            plain, _ = self._gss.GSS_Unwrap_LDAP(self._key, self._recv_exact(length), 0, direction='init')
+            self._buffer = plain
+        chunk, self._buffer = self._buffer[:bufsize], self._buffer[bufsize:]
+        return chunk
 
 """
 Active Directory authentication helper
@@ -267,7 +312,10 @@ class ADAuthentication(object):
         chkField['Lgth'] = 16
         if bindings:
             chkField['Bnd'] = bindings
-        chkField['Flags'] = 0
+        # Ask for integrity and confidentiality. Without this (flags = 0) the server negotiates
+        # no SASL security layer at all and a DC that enforces LDAP signing answers the bind
+        # with result code 8 (strongerAuthRequired), which sends us down the LDAPS path.
+        chkField['Flags'] = GSS_C_SEQUENCE_FLAG | GSS_C_REPLAY_FLAG | GSS_C_CONF_FLAG | GSS_C_INTEG_FLAG
         authenticator['cksum']['checksum'] = chkField.getData()
 
         encodedAuthenticator = encoder.encode(authenticator)
@@ -290,6 +338,8 @@ class ADAuthentication(object):
         connection.result = response
         if response['result'] == 0:
             connection.bound = True
+            # The bind negotiated a SASL security layer, so every following PDU must be wrapped
+            connection.socket = KerberosSignedSocket(connection.socket, sessionkey, cipher)
             connection.refresh_server_info()
         return response['result'] == 0
 
