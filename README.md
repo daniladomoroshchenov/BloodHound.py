@@ -1,7 +1,6 @@
 # BloodHound.py — fork for DCs with LDAP signing enforced and no LDAPS
 
-Fork of [dirkjanm/BloodHound.py](https://github.com/dirkjanm/BloodHound.py), branch
-`fix/ldap-signing-389` (commit `27abe39`). Compatible with BloodHound legacy 4.2/4.3.
+Fork of [dirkjanm/BloodHound.py](https://github.com/dirkjanm/BloodHound.py). Compatible with BloodHound legacy 4.2/4.3.
 
 ## The problem
 
