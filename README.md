@@ -1,67 +1,101 @@
-# BloodHound.py
-![Python 3 compatible](https://img.shields.io/badge/python-3.x-blue.svg)
-![PyPI version](https://img.shields.io/pypi/v/bloodhound.svg)
-![License: MIT](https://img.shields.io/pypi/l/bloodhound.svg)
+# BloodHound.py — fork for DCs with LDAP signing enforced and no LDAPS
 
-BloodHound.py is a Python based ingestor for [BloodHound](https://github.com/BloodHoundAD/BloodHound), based on [Impacket](https://github.com/CoreSecurity/impacket/).
+Fork of [dirkjanm/BloodHound.py](https://github.com/dirkjanm/BloodHound.py), branch
+`fix/ldap-signing-389` (commit `27abe39`). Compatible with BloodHound legacy 4.2/4.3.
 
-The code in this branch is **only compatible with BloodHound 4.2 and 4.3**. For BloodHound CE, check out the [bloodhound-ce branch](https://github.com/dirkjanm/BloodHound.py/tree/bloodhound-ce)
+## The problem
 
-## Installation
-There are different install methods for BloodHound Community Edition (CE) and BloodHound legacy. You can only have one of the two tools installed at the same time, unless you use a virtual environment for both tools, or a package manager like pipx that automatically sets these up.
+On a domain controller with **LDAP signing enforced** and **no TLS certificate**, stock
+`bloodhound-python` 1.9.0 could not authenticate at all: it asked the DC for no SASL security layer,
+the DC refused the bind (result code 8, `strongerAuthRequired`), the tool fell back to LDAPS — and
+LDAPS is dead on such a DC, because every TLS handshake on 636/3269 is reset. Collection ended with
+`LDAPSocketOpenError` and no data, and `--use-ldaps` could not help.
 
-### BloodHound Legacy
-The following install methods are available:
-* Via pip: `pip install bloodhound`
-* Via pipx: `pipx install bloodhound`
-* By cloning this repository `git clone https://github.com/dirkjanm/BloodHound.py` and running `pip install .` from the project directory.
+Reproduced on a Windows Server 2025 DC (HackTheBox lab, machine
+[Checkpoint](https://app.hackthebox.com/machines/Checkpoint)). The DC itself was healthy: `nxc ldap`
+bound with the same credentials and reported `signing:Enforced`, `channel binding:No TLS cert` — the
+limitation was in `bloodhound.py`.
 
-The BloodHound.py Legacy installation will add a command line tool `bloodhound-python` to your PATH.
+IPv6 was not the cause, even though it looked like one: the DC also publishes an AAAA record, and an
+old `domain.py` bug overwrote the already verified IPv4 address with it right before the crash. The
+only blocker was LDAP signing with no LDAPS.
 
-### BloodHound CE
-The following install methods are available:
-* Via pip: `pip install bloodhound-ce`
-* Via pipx: `pipx install bloodhound-ce`
-* By cloning this repository `git clone https://github.com/dirkjanm/BloodHound.py`, checking out the CE branch `git checkout bloodhound-ce` and running `pip install .` from the project directory.
+Example of error:
 
-The BloodHound.py CE ingestor will add a command line tool `bloodhound-ce-python` to your PATH.
+```text
+INFO: BloodHound.py for BloodHound LEGACY (BloodHound 4.2 and 4.3)
+INFO: Found AD domain: checkpoint.htb
+INFO: Getting TGT for user
+INFO: Connecting to LDAP server: dc01.checkpoint.htb
+INFO: Testing resolved hostname connectivity dead:beef::8b2e:c430:c457:a5d2
+INFO: Trying LDAP connection to dead:beef::8b2e:c430:c457:a5d2
+WARNING: LDAP Authentication is refused because LDAP signing is enabled. Trying to connect over LDAPS instead...
+WARNING: Kerberos auth to LDAP failed, trying NTLM
+Traceback (most recent call last):
+  File "/home/danila/Tools/BloodHound.py/bloodhound.py", line 5, in <module>
+    bloodhound.main()
+  File "/home/danila/Tools/BloodHound.py/bloodhound/__init__.py", line 347, in main
+    bloodhound.run(collect=collect,
+  File "/home/danila/Tools/BloodHound.py/bloodhound/__init__.py", line 78, in run
+    self.pdc.prefetch_info('objectprops' in collect, 'acl' in collect, cache_computers=do_computer_enum)
+  File "/home/danila/Tools/BloodHound.py/bloodhound/ad/domain.py", line 620, in prefetch_info
+    self.get_objecttype()
+  File "/home/danila/Tools/BloodHound.py/bloodhound/ad/domain.py", line 303, in get_objecttype
+    self.ldap_connect()
+  File "/home/danila/Tools/BloodHound.py/bloodhound/ad/domain.py", line 114, in ldap_connect
+    ldap = self.ad.auth.getLDAPConnection(hostname=self.hostname, ip=ip,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/danila/Tools/BloodHound.py/bloodhound/ad/authentication.py", line 176, in getLDAPConnection
+    return self.getLDAPConnection(hostname, ip, baseDN, 'ldaps')
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/danila/Tools/BloodHound.py/bloodhound/ad/authentication.py", line 164, in getLDAPConnection
+    bound = conn.bind()
+            ^^^^^^^^^^^
+  File "/home/danila/.venv/lib/python3.12/site-packages/ldap3/core/connection.py", line 589, in bind
+    self.open(read_server_info=False)
+  File "/home/danila/.venv/lib/python3.12/site-packages/ldap3/strategy/sync.py", line 57, in open
+    BaseStrategy.open(self, reset_usage, read_server_info)
+  File "/home/danila/.venv/lib/python3.12/site-packages/ldap3/strategy/base.py", line 154, in open
+    raise LDAPSocketOpenError('invalid server address')
+ldap3.core.exceptions.LDAPSocketOpenError: invalid server address
+```
 
-## Usage
-To use the ingestor, at a minimum you will need credentials of the domain you're logging in to. Credentials can be specified as username + password, NT hash or AES keys, or a Kerberos TGT in a ccache file.
-You will need to specify the `-u` option with a username of this domain (or `username@domain` for a user in a trusted domain). If you have your DNS set up properly and the AD domain is in your DNS search list, then BloodHound.py will automatically detect the domain for you. If not, you have to specify it manually with the `-d` option.
+## The fix (two changes, one commit)
 
-By default BloodHound.py will query LDAP and the individual computers of the domain to enumerate users, computers, groups, trusts, sessions and local admins. 
-If you want to restrict collection, specify the `--collectionmethod` parameter, which supports the following options (similar to SharpHound):
-- *Default* - Performs group membership collection, domain trust collection, local admin collection, and session collection
-- *Group* - Performs group membership collection
-- *LocalAdmin* - Performs local admin collection
-- *RDP* - Performs Remote Desktop Users collection
-- *DCOM* - Performs Distributed COM Users collection
-- *Container* - Performs container collection (GPO/Organizational Units/Default containers)
-- *PSRemote* - Performs Remote Management (PS Remoting) Users collection
-- *DCOnly* - Runs all collection methods that can be queried from the DC only, no connection to member hosts/servers needed. This is equal to Group,Acl,Trusts,ObjectProps,Container
-- *Session* - Performs session collection
-- *Acl* - Performs ACL collection
-- *Trusts* - Performs domain trust enumeration
-- *LoggedOn* - Performs privileged Session enumeration (requires local admin on the target)
-- *ObjectProps* - Performs Object Properties collection for properties such as LastLogon or PwdLastSet
-- *All* - Runs all methods above, except LoggedOn
-- *Experimental* - Connects to individual hosts to enumerate services and scheduled tasks that may have stored credentials
+1. `bloodhound/ad/authentication.py` — the Kerberos LDAP bind now negotiates a SASL security layer
+   (integrity + confidentiality, flags `0x3c`) and every following PDU is wrapped in RFC 4121 tokens,
+   reusing impacket's `GSSAPI` (same framing as `impacket`'s `LDAPConnection(signing=True)`).
+   Works over plain LDAP/389, no TLS involved.
+2. `bloodhound/ad/domain.py` — a verified IPv4 DC address is no longer overwritten by an AAAA record;
+   IPv6 is used only when no IPv4 address answered.
 
-Multiple collectionmethods should be separated by a comma, for example: `-c Group,LocalAdmin`
+Verified on the lab stand: exit code 0, full archive (users, groups, computers, domains, gpos, ous,
+containers), and no `ldaps`/636 attempt anywhere in the log.
 
-You can override some of the automatic detection options, such as the hostname of the primary Domain Controller if you want to use a different Domain Controller with `-dc`, or specify your own Global Catalog with `-gc`.
+## Install and run
 
-## Limitations
-BloodHound.py currently has the following limitations:
-- Supports most, but not all BloodHound (SharpHound) features. Currently GPO local groups are not supported, all other collection methods are implemented.
+```bash
+git clone https://github.com/daniladomoroshchenov/BloodHound.py.git
+cd BloodHound.py && git checkout fix/ldap-signing-389
+python3 -m venv .venv && source .venv/bin/activate
+pip install .
 
-## Docker usage
-1. Build container  
-```docker build -t bloodhound .```  
-2. Run container  
-```docker run -v ${PWD}:/bloodhound-data -it bloodhound```  
-After that you can run `bloodhound-python` inside the container, all data will be stored in the path from where you start the container.
+# must print a path inside the clone and True
+python3 -c "import bloodhound.ad.authentication as a; print(a.__file__, hasattr(a, 'KerberosSignedSocket'))"
 
-## Credits
-BloodHound.py was originally written by Dirk-jan Mollema, Edwin van Vliet and Matthijs Gielen from [Fox-IT (NCC Group)](https://fox-it.com/). BloodHound.py is currently maintained by Dirk-jan Mollema from [Outsider Security](https://outsidersecurity.nl). The implementation and data model is based on the original tool from [SpecterOps](https://specterops.io). Many thanks to everyone who contributed by testing, submitting issues and pull requests over the years.
+bloodhound-python -c All -d <domain> -u '<user>' -p '<password>' \
+  -dc dc01.<domain> -gc dc01.<domain> -ns <dc_ip> --zip
+```
+
+* `-ns <dc_ip>` is mandatory: the tool's own resolver reads `/etc/resolv.conf`, so an `/etc/hosts`
+  entry alone is not enough.
+* Do not add `--use-ldaps` — LDAPS is unavailable on a DC without a certificate.
+* Expected result: `INFO: Done in 00M 0xS`, exit code 0, and `<timestamp>_bloodhound.zip` with
+  7 JSON files.
+* Only `pip install .` from this clone contains the fix; the PyPI package does not.
+* Revert: `pip uninstall bloodhound && pip install bloodhound==1.9.0`, or `git checkout master`.
+
+## Known limitation
+
+Only the Kerberos authentication path is patched. The NTLM fallback is untouched, so on a DC where
+Kerberos is unavailable and LDAPS is dead, collection will still fail.
